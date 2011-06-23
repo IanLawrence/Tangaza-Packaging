@@ -1,0 +1,208 @@
+#! /bin/bash
+
+#
+#    Tangaza
+#
+#    Copyright (C) 2010 Nokia Corporation.
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU Affero General Public License as
+#    published by the Free Software Foundation, either version 3 of the
+#    License, or (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU Affero General Public License for more details.
+#
+#    You should have received a copy of the GNU Affero General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    Author: Billy Odero
+#
+
+set -e
+
+if [ `id -u` != 0 ]; then
+  echo "You must be root to configure the settings."
+  exit 1
+fi
+
+CURR_DIR=$CWD
+
+TGZ_LOCATION=/usr/lib/tangaza
+TGZ_HOME=$TGZ_LOCATION
+TGZ_DATA=/var/lib/tangaza
+
+#Generate the sub directories for data files
+cd $TGZ_DATA/names && perl mkdirs.pl
+cd $TGZ_DATA/status && perl mkdirs.pl
+cd $TGZ_DATA/groups && perl mkdirs.pl
+
+cd $CURR_DIR
+
+AST_PATH=`which asterisk`
+
+if [ ! -n "$AST_PATH" ]; then
+    while [ -n "$PROVIDED_PATH" ]; do
+	echo -n "asterisk path to use [$AST_PATH]:"
+	
+	#check if asterisk exists in the path provided
+	if [ -e "$PROVIDED_PATH"]; then
+	    echo "Asterisk doesnt seem to exist in [$PROVIDED_PATH]"
+	    exit 1;
+	else
+	    echo "Asterisk exists in [$PROVIDED_PATH]"
+	fi
+	AST_PATH=$PROVIDED_PATH
+    done
+fi
+
+AST_USER=`ps aux|grep -i $AST_PATH|awk '!/grep/'|awk 'NR < 2 {print $1}'`
+
+#create database if it doesnt exist
+echo 'Checking if the database already exists. Waiting for the database root password'
+$TGZ_LOCATION/schemas/install-db.sh
+
+#Generate db 
+python $TGZ_LOCATION/django/tangaza/manage.py syncdb
+
+#Download and install Asterisk::FastAGI modules if they dont exist
+CURR_DIR=$CWD
+cd $TGZ_LOCATION/init
+FAST_AGI=`perl check_depends.pl Asterisk::FastAGI`
+MATH_RAND=`perl check_depends.pl Math::Random`
+
+if [ "Missing" == "$FAST_AGI" ]; then
+    wget http://search.cpan.org/CPAN/authors/id/J/JA/JAYWHY/Asterisk-FastAGI-0.02.tar.gz
+    tar -xzf Asterisk-FastAGI-0.02.tar.gz
+    
+    cd Asterisk-FastAGI-0.02/
+    perl Makefile.PL
+    make && make test && make install
+fi
+
+if [ "Missing" == "$MATH_RAND" ]; then
+    wget http://search.cpan.org/CPAN/authors/id/G/GR/GROMMEL/Math-Random-0.71.tar.gz
+    tar -xzf Math-Random-0.71.tar.gz
+    cd Math-Random-0.71/
+    perl Makefile.PL
+    make && make test && make install
+fi
+
+cd $CWD
+
+# Replace existing conf files
+#*****************************
+
+TGZ_CONF=/etc/tangaza
+#1. asterisk
+if [ ! -f "/etc/asterisk/extensions.conf.tgzbak" ]; then
+    echo "Replacing /etc/asterisk/extensions.conf."
+    mv /etc/asterisk/extensions.conf /etc/asterisk/extensions.conf.tgzbak
+    ln -s $TGZ_CONF/asterisk/extensions.conf /etc/asterisk/
+fi
+
+#2. kannel
+if [ ! -f "/etc/kannel/kannel.conf.tgzbak" ]; then
+    echo "Replacing /etc/kannel/kannel.conf."
+    mv /etc/kannel/kannel.conf /etc/kannel/kannel.conf.tgzbak
+    ln -s $TGZ_CONF/kannel/kannel.conf /etc/kannel/
+fi
+
+echo "Replacing /etc/kannel/modem.conf"
+if [ ! -f "/etc/kannel/modem.conf.tgzbak" ]; then
+    mv /etc/kannel/modem.conf /etc/kannel/modem.conf.tgzbak
+    ln -s $TGZ_CONF/kannel/modem.conf /etc/kannel/
+fi
+
+if [ ! -f "/etc/kannel/tangaza.conf" ]; then
+    ln -s $TGZ_CONF/kannel/tangaza.conf /etc/kannel/tangaza.conf
+fi
+
+#restart asterisk
+echo "Restarting asterisk"
+/etc/init.d/asterisk restart
+
+echo "Restarting kannel"
+#/etc/init.d/kannel restart
+#For now stop kannel until config works then start manually
+#/etc/init.d/kannel stop
+
+#set apache configs
+FQDN=`hostname -f`
+
+echo "Adding tangaza-sms to sites-enabled"
+cp $TGZ_CONF/tangaza-sms $TGZ_CONF/tangaza-sms.tgzbak
+
+sed -i "s/your_server_name/$FQDN/g" $TGZ_CONF/tangaza-sms
+
+if [ ! -f "/etc/apache2/sites-enabled/tangaza-sms" ]; then
+    ln -s $TGZ_CONF/tangaza-sms /etc/apache2/sites-enabled/
+    chown root\: /etc/apache2/sites-enabled/tangaza-sms
+fi
+
+#echo "Enabling port 8080"
+#PORT_ENABLED=`grep -i '^Listen 8080$' /etc/apache2/ports.conf`
+#if [ ! -n "$PORT_ENABLED" ]; then
+#    cp /etc/apache2/ports.conf /etc/apache2/ports.conf.bak
+#    sed -i "s/^Listen 80$/Listen 80\nListen 8080/g" /etc/apache2/ports.conf
+#fi
+
+#Check if wsgi_module is loaded if not load it
+WSGI=`find /usr/lib/ -name "mod_wsgi.so" -exec ls {} +;`
+if [ ! -f "/etc/apache2/mods-enabled/wsgi.load" ]; then
+    echo "LoadModule wsgi_module $WSGI" > /etc/apache2/mods-available/wsgi.load
+    ln -s /etc/apache2/mods-available/wsgi.load /etc/apache2/mods-enabled/
+fi
+
+TGZ_DJANGO_MEDIA=/usr/share/tangaza/media
+#set django-admin css files
+if [ -f "$TGZ_DJANGO_MEDIA/css/activity.css" ]; then
+    #For ubuntu
+    if [ -f '/usr/share/pyshared/django/contrib/admin/media/css/dashboard.css' ]; then
+	DJANGO_MEDIA=/usr/share/pyshared/django/contrib/admin/media
+	ln -s $DJANGO_MEDIA/css/* $TGZ_DJANGO_MEDIA/css/
+	ln -s $DJANGO_MEDIA/img $TGZ_DJANGO_MEDIA/
+	ln -s $DJANGO_MEDIA/js/* $TGZ_DJANGO_MEDIA/js/
+    fi
+    
+    #For debian
+    if [ -f '/usr/share/python-support/python-django/django/contrib/admin/media/css/dashboard.css' ]; then
+	DJANGO_MEDIA=/usr/share/python-support/python-django/django/contrib/admin/media
+	ln -s $DJANGO_MEDIA/css/* $TGZ_DJANGO_MEDIA/css/
+	ln -s $DJANGO_MEDIA/img $TGZ_DJANGO_MEDIA/
+	ln -s $DJANGO_MEDIA/js/* $TGZ_DJANGO_MEDIA/js/
+    fi
+fi
+
+#check if apache is running and restart it
+/etc/init.d/apache2 restart
+
+AST_USER=`ps aux|grep -i $AST_PATH|awk '!/grep/'|awk 'NR < 2 {print $1}'`
+
+echo "Setting directory permissions..."
+
+chown -R $AST_USER\: $TGZ_DATA
+chown -R $AST_USER\: /etc/tangaza/
+chown -R $AST_USER\: /var/log/tangaza/
+chown -R $AST_USER\: /var/spool/tangaza/
+chown -R $AST_USER\: /var/lib/asterisk/festivalcache/
+
+
+#Configuring  nagios
+echo "Configuring nagios..."
+echo 'cfg_dir=/etc/tangaza/nagios' >> /etc/nagios3/nagios.cfg
+
+if [ ! -d "/usr/lib/nagios/plugins/tangaza-monitor" ]; then
+    
+    # Add configs to nagios
+    ln -s $TGZ_CONF/nagios/tangaza-monitor/ /usr/lib/nagios/plugins/
+    
+    /etc/init.d/nagios3 restart
+fi
+
+
+#DEBHELPER#
+
+exit 0
